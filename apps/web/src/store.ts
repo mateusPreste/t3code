@@ -16,6 +16,7 @@ import type {
   OrchestrationThreadActivity,
   ProjectId,
   ProviderKind,
+  ProviderRateLimitsSnapshot,
   ScopedProjectRef,
   ScopedThreadRef,
   ThreadId,
@@ -151,6 +152,7 @@ function mapSession(session: OrchestrationSession): ThreadSession {
     createdAt: session.updatedAt,
     updatedAt: session.updatedAt,
     ...(session.lastError ? { lastError: session.lastError } : {}),
+    ...(session.rateLimits !== undefined ? { rateLimits: session.rateLimits } : {}),
   };
 }
 
@@ -1789,6 +1791,34 @@ export function selectSidebarThreadsForProjectRefs(
   if (refs.length === 0) return [];
   if (refs.length === 1) return selectSidebarThreadsForProjectRef(state, refs[0]);
   return refs.flatMap((ref) => selectSidebarThreadsForProjectRef(state, ref));
+}
+
+export function selectLatestRateLimitsForProvider(
+  state: AppState,
+  environmentId: EnvironmentId | null | undefined,
+  provider: ProviderKind | null | undefined,
+): ProviderRateLimitsSnapshot | null {
+  if (!environmentId || !provider) {
+    return null;
+  }
+
+  const environmentState = selectEnvironmentState(state, environmentId);
+  let latestUpdatedAt: string | null = null;
+  let latestRateLimits: ProviderRateLimitsSnapshot | null = null;
+
+  for (const threadId of environmentState.threadIds) {
+    const session = environmentState.threadSessionById[threadId];
+    if (!session || session.provider !== provider || !session.rateLimits) {
+      continue;
+    }
+
+    if (latestUpdatedAt === null || session.updatedAt > latestUpdatedAt) {
+      latestUpdatedAt = session.updatedAt;
+      latestRateLimits = session.rateLimits;
+    }
+  }
+
+  return latestRateLimits;
 }
 
 export function selectBootstrapCompleteForActiveEnvironment(state: AppState): boolean {

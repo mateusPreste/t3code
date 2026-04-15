@@ -3,7 +3,7 @@ import type { EnvironmentId, ThreadId } from "@t3tools/contracts";
 import { memo, useMemo } from "react";
 
 import { useComposerDraftStore, type DraftId } from "../composerDraftStore";
-import { useStore } from "../store";
+import { type AppState, selectLatestRateLimitsForProvider, useStore } from "../store";
 import { createProjectSelectorByRef, createThreadSelectorByRef } from "../storeSelectors";
 import {
   type EnvMode,
@@ -13,6 +13,7 @@ import {
 import { BranchToolbarBranchSelector } from "./BranchToolbarBranchSelector";
 import { BranchToolbarEnvironmentSelector } from "./BranchToolbarEnvironmentSelector";
 import { BranchToolbarEnvModeSelector } from "./BranchToolbarEnvModeSelector";
+import { BranchToolbarRateLimit } from "./BranchToolbarRateLimit";
 import { Separator } from "./ui/separator";
 
 interface BranchToolbarProps {
@@ -77,6 +78,19 @@ export const BranchToolbar = memo(function BranchToolbar({
   const showEnvironmentPicker =
     availableEnvironments && availableEnvironments.length > 1 && onEnvironmentChange;
 
+  const activeProvider =
+    serverThread?.session?.provider ??
+    serverThread?.modelSelection.provider ??
+    activeProject?.defaultModelSelection?.provider ??
+    null;
+  const providerRateLimitsSelector = useMemo(
+    () => (state: AppState) =>
+      selectLatestRateLimitsForProvider(state, environmentId, activeProvider),
+    [environmentId, activeProvider],
+  );
+  const latestProviderRateLimits = useStore(providerRateLimitsSelector);
+  const displayedRateLimits = serverThread?.session?.rateLimits ?? latestProviderRateLimits ?? null;
+
   if (!hasActiveThread || !activeProject) return null;
 
   return (
@@ -100,6 +114,8 @@ export const BranchToolbar = memo(function BranchToolbar({
           onEnvModeChange={onEnvModeChange}
         />
       </div>
+
+      <BranchToolbarRateLimit rateLimits={displayedRateLimits} />
 
       <BranchToolbarBranchSelector
         environmentId={environmentId}

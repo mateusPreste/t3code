@@ -175,6 +175,60 @@ function createCollabNotificationHarness() {
   return { manager, context, emitEvent, updateSession };
 }
 
+function createRateLimitRefreshHarness() {
+  const manager = new CodexAppServerManager();
+  const context = {
+    session: {
+      provider: "codex",
+      status: "running",
+      threadId: asThreadId("thread_1"),
+      runtimeMode: "full-access",
+      model: "gpt-5.3-codex",
+      activeTurnId: "turn_1",
+      resumeCursor: { threadId: "provider_1" },
+      createdAt: "2026-02-10T00:00:00.000Z",
+      updatedAt: "2026-02-10T00:00:00.000Z",
+    },
+    account: {
+      type: "unknown",
+      planType: null,
+      sparkEnabled: true,
+    },
+    pending: new Map(),
+    pendingApprovals: new Map(),
+    pendingUserInputs: new Map(),
+    collabReceiverTurns: new Map<string, string>(),
+    nextRequestId: 1,
+    stopping: false,
+  };
+
+  const emitEvent = vi
+    .spyOn(manager as unknown as { emitEvent: (...args: unknown[]) => void }, "emitEvent")
+    .mockImplementation(() => {});
+  const updateSession = vi
+    .spyOn(manager as unknown as { updateSession: (...args: unknown[]) => void }, "updateSession")
+    .mockImplementation(() => {});
+  const sendRequest = vi
+    .spyOn(
+      manager as unknown as { sendRequest: (...args: unknown[]) => Promise<unknown> },
+      "sendRequest",
+    )
+    .mockResolvedValue({
+      account: {
+        type: "chatgpt",
+        planType: "pro",
+        rateLimits: {
+          primary: {
+            usedPercent: 25,
+            windowDurationMins: 300,
+          },
+        },
+      },
+    });
+
+  return { manager, context, emitEvent, updateSession, sendRequest };
+}
+
 describe("classifyCodexStderrLine", () => {
   it("ignores empty lines", () => {
     expect(classifyCodexStderrLine("   ")).toBeNull();
@@ -993,6 +1047,40 @@ describe("collab child conversation routing", () => {
         itemId: "call_child_1",
       }),
     );
+  });
+});
+
+describe("rate-limit refresh", () => {
+  it("refreshes account/read and emits account/rateLimits/updated after turn completion", async () => {
+    const { manager, context, emitEvent, sendRequest } = createRateLimitRefreshHarness();
+
+    (
+      manager as unknown as {
+        handleServerNotification: (context: unknown, notification: Record<string, unknown>) => void;
+      }
+    ).handleServerNotification(context, {
+      method: "turn/completed",
+      params: {
+        turn: { id: "turn_1", status: "completed" },
+      },
+    });
+
+    await vi.waitFor(() => {
+      expect(sendRequest).toHaveBeenCalledWith(context, "account/read", {});
+      expect(emitEvent).toHaveBeenCalledWith(
+        expect.objectContaining({
+          method: "account/rateLimits/updated",
+          kind: "notification",
+          threadId: "thread_1",
+          payload: {
+            primary: {
+              usedPercent: 25,
+              windowDurationMins: 300,
+            },
+          },
+        }),
+      );
+    });
   });
 });
 

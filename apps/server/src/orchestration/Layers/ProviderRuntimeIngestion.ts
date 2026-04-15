@@ -5,6 +5,9 @@ import {
   MessageId,
   type OrchestrationEvent,
   type OrchestrationProposedPlanId,
+  type ProviderRateLimitsSnapshot,
+  type ProviderRateLimitWindow,
+  type ProviderRateLimitCredits,
   CheckpointRef,
   isToolLifecycleItemType,
   ThreadId,
@@ -501,6 +504,129 @@ function runtimeEventToActivities(
   return [];
 }
 
+// -----------------------------------------------------------------------------
+// Rate-limit normalisation (Codex + Claude)
+// -----------------------------------------------------------------------------
+
+function rlAsObject(value: unknown): Record<string, unknown> | undefined {
+  if (!value || typeof value !== "object") return undefined;
+  return value as Record<string, unknown>;
+}
+
+function rlAsNumber(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) ? value : undefined;
+}
+
+function rlAsString(value: unknown): string | undefined {
+  return typeof value === "string" && value.trim().length > 0 ? value.trim() : undefined;
+}
+
+function normalizeRateLimitWindow(raw: unknown): ProviderRateLimitWindow | null {
+  const source = rlAsObject(raw);
+  if (!source) return null;
+  const usedPercent = rlAsNumber(source.usedPercent ?? source.used_percent);
+  if (usedPercent === undefined) return null;
+  return {
+    usedPercent,
+    windowDurationMins: rlAsNumber(source.windowDurationMins ?? source.window_duration_mins),
+    resetsAt: rlAsNumber(source.resetsAt ?? source.resets_at),
+  };
+}
+
+function normalizeCredits(raw: unknown): ProviderRateLimitCredits | null {
+  const source = rlAsObject(raw);
+  if (!source) return null;
+  const hasCredits = source.hasCredits ?? source.has_credits;
+  const unlimited = source.unlimited;
+  const balance = source.balance ?? null;
+  return {
+    hasCredits: typeof hasCredits === "boolean" ? hasCredits : false,
+    unlimited: typeof unlimited === "boolean" ? unlimited : false,
+    balance:
+      typeof balance === "string" ? balance : typeof balance === "number" ? String(balance) : null,
+  };
+}
+
+/**
+ * Normalize raw rate-limit payloads from Codex or Claude into the canonical
+ * `ProviderRateLimitsSnapshot` shape.
+ *
+ * Codex sends: `{ primary: { usedPercent, windowDurationMins, resetsAt }, secondary, credits, planType }`
+ * Claude sends: `{ type: "rate_limit_event", rate_limit_info: { status, resetsAt, rateLimitType, utilization } }`
+ */
+function normalizeRateLimits(
+  raw: unknown,
+  provider: "codex" | "claudeAgent",
+  previous: ProviderRateLimitsSnapshot | null | undefined,
+): ProviderRateLimitsSnapshot | null {
+  const root = rlAsObject(raw);
+  if (!root) return null;
+
+  // --- Claude path ---
+  if (provider === "claudeAgent") {
+    // The adapter wraps the full SDK message: { type: "rate_limit_event", rate_limit_info: { ... } }
+    const claudeInfo = rlAsObject(root.rate_limit_info);
+    if (!claudeInfo) return null;
+
+    const utilization = rlAsNumber(claudeInfo.utilization);
+    const usedPercent = utilization !== undefined ? Math.round(utilization * 100) : undefined;
+    const resetsAt = rlAsNumber(claudeInfo.resetsAt);
+    const rateLimitType = rlAsString(claudeInfo.rateLimitType ?? claudeInfo.rate_limit_type);
+    const status = rlAsString(claudeInfo.status);
+
+    // Map Claude rateLimitType to primary (5-hour) or secondary (7-day) window.
+    const isSecondary =
+      rateLimitType === "seven_day" ||
+      rateLimitType === "seven_day_opus" ||
+      rateLimitType === "seven_day_sonnet";
+
+    const previousPrimary = previous?.primary ?? null;
+    const previousSecondary = previous?.secondary ?? null;
+
+    // utilization is optional in the Claude SDK.
+    // Priority: real value → rejected sentinel → last known value for this window → 0 (unknown).
+    // Defaulting to 0 on the first event without utilization is intentional: it lets the component
+    // display the resetsAt date even when Anthropic omits the utilization field.
+    const previousWindow = isSecondary ? previousSecondary : previousPrimary;
+    const effectiveUsedPercent =
+      usedPercent ?? (status === "rejected" ? 100 : (previousWindow?.usedPercent ?? 0));
+
+    const window: ProviderRateLimitWindow = {
+      usedPercent: effectiveUsedPercent,
+      resetsAt,
+    };
+
+    return {
+      limitId: rateLimitType ?? previous?.limitId ?? null,
+      planType: previous?.planType ?? null,
+      primary: isSecondary ? previousPrimary : window,
+      secondary: isSecondary ? window : previousSecondary,
+      credits: previous?.credits ?? null,
+    };
+  }
+
+  // --- Codex path ---
+  // The adapter passes `event.payload ?? {}` as rateLimits; the actual data
+  // may be nested under `rateLimits` / `rate_limits` or flat at the root.
+  const codexSource = rlAsObject(root.rateLimits ?? root.rate_limits) ?? root;
+  const codexPrimary = normalizeRateLimitWindow(codexSource.primary);
+  const codexSecondary = normalizeRateLimitWindow(codexSource.secondary);
+
+  if (!codexPrimary && !codexSecondary) return null;
+
+  const codexCredits = normalizeCredits(codexSource.credits);
+  const codexPlanType = rlAsString(codexSource.planType ?? codexSource.plan_type);
+  const codexLimitId = rlAsString(codexSource.limitId ?? codexSource.limit_id);
+
+  return {
+    limitId: codexLimitId ?? previous?.limitId ?? null,
+    planType: codexPlanType ?? previous?.planType ?? null,
+    primary: codexPrimary ?? previous?.primary ?? null,
+    secondary: codexSecondary ?? previous?.secondary ?? null,
+    credits: codexCredits ?? previous?.credits ?? null,
+  };
+}
+
 const make = Effect.fn("make")(function* () {
   const orchestrationEngine = yield* OrchestrationEngineService;
   const providerService = yield* ProviderService;
@@ -990,6 +1116,7 @@ const make = Effect.fn("make")(function* () {
             activeTurnId: nextActiveTurnId,
             lastError,
             updatedAt: now,
+            rateLimits: thread.session?.rateLimits ?? null,
           },
           createdAt: now,
         });
@@ -1140,6 +1267,31 @@ const make = Effect.fn("make")(function* () {
       yield* clearTurnStateForSession(thread.id);
     }
 
+    // --- Rate limits: normalise and persist on session ---
+    if (event.type === "account.rate-limits.updated") {
+      const raw = (event.payload as { rateLimits?: unknown }).rateLimits;
+      const previousRateLimits = thread.session?.rateLimits ?? null;
+      const rateLimits = normalizeRateLimits(raw, event.provider, previousRateLimits);
+      if (rateLimits) {
+        yield* orchestrationEngine.dispatch({
+          type: "thread.session.set",
+          commandId: providerCommandId(event, "rate-limits-session-set"),
+          threadId: thread.id,
+          session: {
+            threadId: thread.id,
+            status: thread.session?.status ?? "ready",
+            providerName: thread.session?.providerName ?? event.provider,
+            runtimeMode: thread.session?.runtimeMode ?? "full-access",
+            activeTurnId: thread.session?.activeTurnId ?? null,
+            lastError: thread.session?.lastError ?? null,
+            updatedAt: now,
+            rateLimits,
+          },
+          createdAt: now,
+        });
+      }
+    }
+
     if (event.type === "runtime.error") {
       const runtimeErrorMessage = event.payload.message;
 
@@ -1160,6 +1312,7 @@ const make = Effect.fn("make")(function* () {
             activeTurnId: eventTurnId ?? null,
             lastError: runtimeErrorMessage,
             updatedAt: now,
+            rateLimits: thread.session?.rateLimits ?? null,
           },
           createdAt: now,
         });

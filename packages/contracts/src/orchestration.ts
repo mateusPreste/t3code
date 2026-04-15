@@ -203,6 +203,29 @@ export const OrchestrationSessionStatus = Schema.Literals([
 ]);
 export type OrchestrationSessionStatus = typeof OrchestrationSessionStatus.Type;
 
+export const ProviderRateLimitWindow = Schema.Struct({
+  usedPercent: Schema.Number,
+  windowDurationMins: Schema.optional(Schema.Number),
+  resetsAt: Schema.optional(Schema.Number),
+});
+export type ProviderRateLimitWindow = typeof ProviderRateLimitWindow.Type;
+
+export const ProviderRateLimitCredits = Schema.Struct({
+  hasCredits: Schema.Boolean,
+  unlimited: Schema.Boolean,
+  balance: Schema.optional(Schema.NullOr(Schema.String)),
+});
+export type ProviderRateLimitCredits = typeof ProviderRateLimitCredits.Type;
+
+export const ProviderRateLimitsSnapshot = Schema.Struct({
+  limitId: Schema.optional(Schema.NullOr(TrimmedNonEmptyString)),
+  planType: Schema.optional(Schema.NullOr(TrimmedNonEmptyString)),
+  primary: Schema.optional(Schema.NullOr(ProviderRateLimitWindow)),
+  secondary: Schema.optional(Schema.NullOr(ProviderRateLimitWindow)),
+  credits: Schema.optional(Schema.NullOr(ProviderRateLimitCredits)),
+});
+export type ProviderRateLimitsSnapshot = typeof ProviderRateLimitsSnapshot.Type;
+
 export const OrchestrationSession = Schema.Struct({
   threadId: ThreadId,
   status: OrchestrationSessionStatus,
@@ -211,6 +234,7 @@ export const OrchestrationSession = Schema.Struct({
   activeTurnId: Schema.NullOr(TurnId),
   lastError: Schema.NullOr(TrimmedNonEmptyString),
   updatedAt: IsoDateTime,
+  rateLimits: Schema.optional(Schema.NullOr(ProviderRateLimitsSnapshot)),
 });
 export type OrchestrationSession = typeof OrchestrationSession.Type;
 

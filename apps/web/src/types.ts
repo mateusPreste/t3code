@@ -165,4 +165,5 @@ export interface ThreadSession {
   updatedAt: string;
   lastError?: string;
   orchestrationStatus: OrchestrationSessionStatus;
+  rateLimits?: import("@t3tools/contracts").ProviderRateLimitsSnapshot | null;
 }

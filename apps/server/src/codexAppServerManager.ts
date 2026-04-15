@@ -507,22 +507,16 @@ export class CodexAppServerManager extends EventEmitter<CodexAppServerManagerEve
 
       this.writeMessage(context, { method: "initialized" });
       try {
-        const modelListResponse = await this.sendRequest(context, "model/list", {});
-        console.log("codex model/list response", modelListResponse);
-      } catch (error) {
-        console.log("codex model/list failed", error);
+        await this.sendRequest(context, "model/list", {});
+      } catch {
+        // model/list is opportunistic here; startup should continue without it.
       }
       try {
         const accountReadResponse = await this.sendRequest(context, "account/read", {});
-        console.log("codex account/read response", accountReadResponse);
         context.account = readCodexAccountSnapshot(accountReadResponse);
-        console.log("codex subscription status", {
-          type: context.account.type,
-          planType: context.account.planType,
-          sparkEnabled: context.account.sparkEnabled,
-        });
-      } catch (error) {
-        console.log("codex account/read failed", error);
+        this.emitRateLimitsUpdatedFromAccountRead(context, accountReadResponse);
+      } catch {
+        // account/read can fail transiently during startup; retry after session is ready.
       }
 
       const normalizedModel = resolveCodexModelForAccount(
@@ -628,6 +622,7 @@ export class CodexAppServerManager extends EventEmitter<CodexAppServerManagerEve
         requestedRuntimeMode: input.runtimeMode,
       }).pipe(this.runPromise);
       this.emitLifecycleEvent(context, "session/ready", `Connected to thread ${providerThreadId}`);
+      void this.refreshRateLimitsFromAccountRead(context);
       return { ...context.session };
     } catch (error) {
       const message = error instanceof Error ? error.message : "Failed to start Codex session.";
@@ -1110,6 +1105,7 @@ export class CodexAppServerManager extends EventEmitter<CodexAppServerManagerEve
         activeTurnId: undefined,
         lastError: errorMessage ?? context.session.lastError,
       });
+      void this.refreshRateLimitsFromAccountRead(context);
       return;
     }
 
@@ -1294,6 +1290,60 @@ export class CodexAppServerManager extends EventEmitter<CodexAppServerManagerEve
 
   private emitEvent(event: ProviderEvent): void {
     this.emit("event", event);
+  }
+
+  private async refreshRateLimitsFromAccountRead(context: CodexSessionContext): Promise<void> {
+    try {
+      const accountReadResponse = await this.sendRequest(context, "account/read", {});
+      context.account = readCodexAccountSnapshot(accountReadResponse);
+      this.emitRateLimitsUpdatedFromAccountRead(context, accountReadResponse);
+    } catch {
+      // Best-effort refresh; keep turn/session flow predictable even if this fails.
+    }
+  }
+
+  private emitRateLimitsUpdatedFromAccountRead(
+    context: CodexSessionContext,
+    accountReadResponse: unknown,
+  ): void {
+    const rateLimits = this.extractRateLimitsFromAccountRead(accountReadResponse);
+    if (rateLimits === undefined) {
+      return;
+    }
+
+    this.emitEvent({
+      id: EventId.make(randomUUID()),
+      kind: "notification",
+      provider: "codex",
+      threadId: context.session.threadId,
+      createdAt: new Date().toISOString(),
+      method: "account/rateLimits/updated",
+      payload: rateLimits,
+    });
+  }
+
+  private extractRateLimitsFromAccountRead(accountReadResponse: unknown): unknown | undefined {
+    const root = this.readObject(accountReadResponse);
+    if (!root) {
+      return undefined;
+    }
+
+    const account = this.readObject(root, "account");
+    const nestedRateLimits = account?.rateLimits ?? account?.rate_limits;
+    if (nestedRateLimits !== undefined) {
+      return nestedRateLimits;
+    }
+
+    const topLevelRateLimits = root.rateLimits ?? root.rate_limits;
+    if (topLevelRateLimits !== undefined) {
+      return topLevelRateLimits;
+    }
+
+    if (root.primary !== undefined || root.secondary !== undefined) {
+      return root;
+    }
+
+    return undefined;
   }
 
   private assertSupportedCodexCliVersion(input: {
